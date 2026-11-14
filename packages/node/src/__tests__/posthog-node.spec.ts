@@ -3715,6 +3715,101 @@ describe('PostHog Node.js', () => {
       expect(posthogWithoutLocalEval['featureFlagsPoller']).toBeUndefined()
     })
 
+    describe('caching', () => {
+      const remoteConfigCalls = (): number =>
+        mockedFetch.mock.calls.filter(([url]) => String(url).includes('/remote_config')).length
+      const respondWith = (status: number, body: unknown): void => {
+        mockedFetch.mockResolvedValue({ status, json: () => Promise.resolve(body) } as any)
+      }
+      const flushBackgroundRefresh = async (): Promise<void> => {
+        for (let i = 0; i < 5; i++) {
+          await Promise.resolve()
+        }
+      }
+
+      beforeEach(() => {
+        vi.useFakeTimers({ toFake: ['Date'] })
+        vi.setSystemTime(new Date('2030-01-01T00:00:00Z'))
+        requestRemoteConfigPayloadSpy.mockRestore()
+      })
+
+      afterEach(() => {
+        vi.useRealTimers()
+      })
+
+      it('serves a fresh payload without another request', async () => {
+        respondWith(200, { v: 1 })
+
+        await expect(posthog.getRemoteConfigPayload('test-flag')).resolves.toEqual({ v: 1 })
+        vi.setSystemTime(Date.now() + 29_000)
+        respondWith(200, { v: 2 })
+        await expect(posthog.getRemoteConfigPayload('test-flag')).resolves.toEqual({ v: 1 })
+
+        expect(remoteConfigCalls()).toBe(1)
+      })
+
+      it('serves the cached payload while refreshing a stale one in the background', async () => {
+        respondWith(200, { v: 1 })
+        await posthog.getRemoteConfigPayload('test-flag')
+
+        vi.setSystemTime(Date.now() + 31_000)
+        respondWith(200, { v: 2 })
+        await expect(posthog.getRemoteConfigPayload('test-flag')).resolves.toEqual({ v: 1 })
+        await flushBackgroundRefresh()
+
+        await expect(posthog.getRemoteConfigPayload('test-flag')).resolves.toEqual({ v: 2 })
+        expect(remoteConfigCalls()).toBe(2)
+      })
+
+      it('keeps serving the last good payload when a refresh fails', async () => {
+        respondWith(200, { v: 1 })
+        await posthog.getRemoteConfigPayload('test-flag')
+
+        vi.setSystemTime(Date.now() + 31_000)
+        respondWith(500, {})
+        await posthog.getRemoteConfigPayload('test-flag')
+        await flushBackgroundRefresh()
+
+        await expect(posthog.getRemoteConfigPayload('test-flag')).resolves.toEqual({ v: 1 })
+        expect(remoteConfigCalls()).toBe(2)
+      })
+
+      it('does not cache a failed first request', async () => {
+        respondWith(404, undefined)
+        await posthog.getRemoteConfigPayload('test-flag')
+        respondWith(200, { v: 1 })
+
+        await expect(posthog.getRemoteConfigPayload('test-flag')).resolves.toEqual({ v: 1 })
+      })
+
+      it('does not let callers change the cached payload', async () => {
+        respondWith(200, { list: ['a'] })
+        const first = (await posthog.getRemoteConfigPayload('test-flag')) as { list: string[] }
+        first.list.push('b')
+
+        await expect(posthog.getRemoteConfigPayload('test-flag')).resolves.toEqual({ list: ['a'] })
+      })
+
+      it.each([
+        ['enableRemoteConfigCache is false', { enableRemoteConfigCache: false }],
+        ['featureFlagsPollingInterval is null', { featureFlagsPollingInterval: null }],
+      ])('requests the payload on every call when %s', async (_label, options) => {
+        const uncached = new PostHog('TEST_API_KEY', {
+          host: 'http://example.com',
+          fetchRetryCount: 0,
+          disableCompression: true,
+          personalApiKey: 'TEST_PERSONAL_API_KEY',
+          enableLocalEvaluation: false,
+          ...options,
+        })
+        respondWith(200, { v: 1 })
+        await uncached.getRemoteConfigPayload('test-flag')
+        respondWith(200, { v: 2 })
+
+        await expect(uncached.getRemoteConfigPayload('test-flag')).resolves.toEqual({ v: 2 })
+      })
+    })
+
     it('should include project API key in the remote config URL', async () => {
       mockedFetch.mockResolvedValue({
         status: 200,

@@ -174,6 +174,11 @@ function resolveRenamedOptions(options: PostHogOptions): PostHogOptions {
   return resolved as PostHogOptions
 }
 
+// Payloads are JSON, so a round trip copies them. Callers get their own copy and can't change the cached one.
+function cloneJson<T extends JsonType | undefined>(value: T): T {
+  return value !== null && typeof value === 'object' ? JSON.parse(JSON.stringify(value)) : value
+}
+
 function normalizeApiKey(value?: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }
@@ -468,6 +473,9 @@ export abstract class PostHogBackendClient extends PostHogCoreStateless implemen
   // `$feature_flag_called` keys so that a reported call never suppresses its exposure. Same bound
   // and eviction. Shutdown clears it.
   private _experimentExposuresReported: Map<string, Set<string>> = new Map()
+  // Remote config payloads by flag key, and the fetches currently running for them.
+  private _remoteConfigCache: Map<string, { payload: JsonType | undefined; lastAttemptAt: number }> = new Map()
+  private _remoteConfigRequests: Map<string, Promise<{ payload: JsonType | undefined }>> = new Map()
 
   /**
    * Snapshot of the `$feature_flag_called` dedupe state, keyed by distinct id.
@@ -2653,25 +2661,93 @@ export abstract class PostHogBackendClient extends PostHogCoreStateless implemen
       throw new Error('Personal API key is required for remote config payload decryption')
     }
 
+    const ttlMs = this._remoteConfigCacheTtlMs()
+    if (ttlMs === null) {
+      return (await this._fetchRemoteConfigPayload(flagKey)).payload
+    }
+
+    const cached = this._remoteConfigCache.get(flagKey)
+    if (cached) {
+      if (Date.now() - cached.lastAttemptAt >= ttlMs) {
+        // Serve the cached payload now and refresh it in the background.
+        void this._refreshRemoteConfigPayload(flagKey).catch(() => {})
+      }
+      return cloneJson(cached.payload)
+    }
+
+    // Nothing cached yet: wait for the first fetch. Concurrent callers share it.
+    const result = await this._refreshRemoteConfigPayload(flagKey)
+    return cloneJson(result.payload)
+  }
+
+  /**
+   * The cache lifetime for remote config payloads, or null when caching is off. Caching follows
+   * `featureFlagsPollingInterval`, so a null interval (no automatic refresh) also turns it off.
+   */
+  private _remoteConfigCacheTtlMs(): number | null {
+    if (this.options.enableRemoteConfigCache === false) {
+      return null
+    }
+    return this.options.featureFlagsPollingInterval ?? null
+  }
+
+  /**
+   * Fetch a payload and store it when the response is a success. A failed fetch (network error,
+   * non-2xx response) never replaces a payload that is already cached; it only postpones the next attempt.
+   */
+  private _refreshRemoteConfigPayload(flagKey: string): Promise<{ payload: JsonType | undefined }> {
+    const inFlight = this._remoteConfigRequests.get(flagKey)
+    if (inFlight) {
+      return inFlight
+    }
+
+    const request = (async () => {
+      const previous = this._remoteConfigCache.get(flagKey)
+      try {
+        const { payload, ok } = await this._fetchRemoteConfigPayload(flagKey)
+        if (ok) {
+          this._remoteConfigCache.set(flagKey, { payload, lastAttemptAt: Date.now() })
+        } else if (previous) {
+          previous.lastAttemptAt = Date.now()
+        }
+        return { payload: ok ? payload : previous?.payload }
+      } catch (error) {
+        if (!previous) {
+          throw error
+        }
+        previous.lastAttemptAt = Date.now()
+        this._events.emit('error', error)
+        return { payload: previous.payload }
+      } finally {
+        this._remoteConfigRequests.delete(flagKey)
+      }
+    })()
+
+    this._remoteConfigRequests.set(flagKey, request)
+    return request
+  }
+
+  private async _fetchRemoteConfigPayload(flagKey: string): Promise<{ payload: JsonType | undefined; ok: boolean }> {
     const response = await this._requestRemoteConfigPayload(flagKey)
     if (!response) {
-      return undefined
+      return { payload: undefined, ok: false }
     }
 
     const parsed = await response.json()
+    const ok = typeof response.status !== 'number' || (response.status >= 200 && response.status < 300)
     // The payload from the endpoint is stored as a JSON encoded string. So when we return
     // it, it's effectively double encoded. As far as we know, we should never get single-encoded
     // JSON, but we'll be defensive here just in case.
     if (typeof parsed === 'string') {
       try {
         // If the parsed value is a string, try parsing it again to handle double-encoded JSON
-        return JSON.parse(parsed)
+        return { payload: JSON.parse(parsed), ok }
       } catch (e) {
         // If second parse fails, return the string as is
-        return parsed
+        return { payload: parsed, ok }
       }
     }
-    return parsed
+    return { payload: parsed, ok }
   }
 
   /**
@@ -3885,6 +3961,7 @@ export abstract class PostHogBackendClient extends PostHogCoreStateless implemen
       await logsDrained
       this._distinctIdHasSentFlagCalls.clear()
       this._experimentExposuresReported.clear()
+      this._remoteConfigCache.clear()
       resolve?.()
     }
   }

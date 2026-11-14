@@ -490,6 +490,19 @@ export type PostHogOptions = Omit<
   // We recommend setting this to false if you are only using the secretKey for evaluating remote config payloads via `getRemoteConfigPayload` and not using local evaluation.
   enableLocalEvaluation?: boolean
   /**
+   * Whether `getRemoteConfigPayload` caches payloads in memory and refreshes them in the background.
+   * Defaults to true.
+   *
+   * A cached payload is returned immediately. Once it is older than `featureFlagsPollingInterval`
+   * (30 seconds by default), the next call returns the cached value and refreshes it in the background.
+   * If a refresh fails, the last good payload keeps being served. Set `featureFlagsPollingInterval` to null,
+   * or this option to false, to request the payload from PostHog on every call.
+   *
+   * The payload is always the one PostHog returns from the remote config endpoint, so encrypted payloads
+   * are decrypted by PostHog and cached in memory in their decrypted form.
+   */
+  enableRemoteConfigCache?: boolean
+  /**
    * Optional cache provider for feature flag definitions.
    *
    * Allows custom caching strategies (Redis, database, etc.) for flag definitions
