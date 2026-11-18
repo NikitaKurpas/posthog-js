@@ -2,4 +2,4 @@
 'posthog-node': minor
 ---
 
-feat(node): cache `getRemoteConfigPayload` results in memory and refresh them in the background
+feat(node): answer `getRemoteConfigPayload` from local evaluation definitions, and cache the payloads it requests from PostHog

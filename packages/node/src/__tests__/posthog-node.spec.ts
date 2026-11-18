@@ -3715,6 +3715,65 @@ describe('PostHog Node.js', () => {
       expect(posthogWithoutLocalEval['featureFlagsPoller']).toBeUndefined()
     })
 
+    it("should return undefined for the endpoint's null payload of a disabled flag", async () => {
+      requestRemoteConfigPayloadSpy.mockResolvedValue({ status: 200, json: () => Promise.resolve(null) })
+
+      await expect(posthog.getRemoteConfigPayload('test-flag')).resolves.toBeUndefined()
+    })
+
+    describe('with local evaluation definitions', () => {
+      const remoteConfigFlag = {
+        id: 1,
+        key: 'test-flag',
+        active: true,
+        deleted: false,
+        is_remote_configuration: true,
+        filters: {
+          groups: [{ properties: [], rollout_percentage: 100 }],
+          payloads: { true: '{"from":"definitions"}' },
+        },
+      }
+
+      it.each([
+        ['an active remote config flag', remoteConfigFlag, { from: 'definitions' }, 0],
+        ['a disabled remote config flag', { ...remoteConfigFlag, active: false }, undefined, 0],
+        ['a regular flag', { ...remoteConfigFlag, is_remote_configuration: false }, undefined, 0],
+        [
+          'a remote config flag with an empty payload',
+          { ...remoteConfigFlag, filters: { ...remoteConfigFlag.filters, payloads: { true: '' } } },
+          undefined,
+          0,
+        ],
+        [
+          'a flag from a server without the marker',
+          { ...remoteConfigFlag, is_remote_configuration: undefined },
+          { from: 'endpoint' },
+          1,
+        ],
+        ['a flag missing from the definitions', undefined, { from: 'endpoint' }, 1],
+      ])('answers %s', async (_label, flag, expected, remoteConfigRequests) => {
+        const definitions = apiImplementation({ localFlags: { flags: flag ? [flag] : [] } })
+        mockedFetch.mockImplementation((url: any, options: any) =>
+          String(url).includes('/remote_config')
+            ? Promise.resolve({ status: 200, json: () => Promise.resolve('{"from":"endpoint"}') } as any)
+            : definitions(url, options)
+        )
+        requestRemoteConfigPayloadSpy.mockRestore()
+        const client = new PostHog('TEST_API_KEY', {
+          host: 'http://example.com',
+          fetchRetryCount: 0,
+          disableCompression: true,
+          personalApiKey: 'TEST_PERSONAL_API_KEY',
+        })
+
+        await expect(client.getRemoteConfigPayload('test-flag')).resolves.toEqual(expected)
+        expect(mockedFetch.mock.calls.filter(([url]) => String(url).includes('/remote_config'))).toHaveLength(
+          remoteConfigRequests
+        )
+        await client.shutdown()
+      })
+    })
+
     describe('caching', () => {
       const remoteConfigCalls = (): number =>
         mockedFetch.mock.calls.filter(([url]) => String(url).includes('/remote_config')).length

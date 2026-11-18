@@ -179,6 +179,23 @@ function cloneJson<T extends JsonType | undefined>(value: T): T {
   return value !== null && typeof value === 'object' ? JSON.parse(JSON.stringify(value)) : value
 }
 
+// Remote config payloads are stored as JSON encoded strings, so the endpoint's response is
+// effectively double encoded. A value that isn't valid JSON is returned as the string itself.
+// An empty payload, and the endpoint's null for a disabled flag, mean there is no payload.
+function decodeRemoteConfigPayload(raw: unknown): JsonType | undefined {
+  if (raw === null || raw === undefined || raw === '') {
+    return undefined
+  }
+  if (typeof raw !== 'string') {
+    return raw as JsonType
+  }
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return raw
+  }
+}
+
 function normalizeApiKey(value?: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }
@@ -2636,6 +2653,11 @@ export abstract class PostHogBackendClient extends PostHogCoreStateless implemen
   /**
    * Get the remote config payload for a feature flag.
    *
+   * With local evaluation enabled, the payload comes from the polled flag definitions when PostHog
+   * marks the flag as remote config there, with no request. Encrypted payloads, and flags from
+   * servers that don't mark remote config flags, are requested from PostHog and cached
+   * (see `enableRemoteConfigCache`). A disabled flag has no payload.
+   *
    * @example
    * ```ts
    * // Get remote config payload
@@ -2659,6 +2681,11 @@ export abstract class PostHogBackendClient extends PostHogCoreStateless implemen
 
     if (!this.options.personalApiKey) {
       throw new Error('Personal API key is required for remote config payload decryption')
+    }
+
+    const local = await this._getRemoteConfigPayloadLocally(flagKey)
+    if (local.resolved) {
+      return cloneJson(local.payload)
     }
 
     const ttlMs = this._remoteConfigCacheTtlMs()
@@ -2735,19 +2762,32 @@ export abstract class PostHogBackendClient extends PostHogCoreStateless implemen
 
     const parsed = await response.json()
     const ok = typeof response.status !== 'number' || (response.status >= 200 && response.status < 300)
-    // The payload from the endpoint is stored as a JSON encoded string. So when we return
-    // it, it's effectively double encoded. As far as we know, we should never get single-encoded
-    // JSON, but we'll be defensive here just in case.
-    if (typeof parsed === 'string') {
-      try {
-        // If the parsed value is a string, try parsing it again to handle double-encoded JSON
-        return { payload: JSON.parse(parsed), ok }
-      } catch (e) {
-        // If second parse fails, return the string as is
-        return { payload: parsed, ok }
-      }
+    return { payload: decodeRemoteConfigPayload(parsed), ok }
+  }
+
+  /**
+   * Answer from the local evaluation definitions the way the remote_config endpoint would.
+   * Returns `resolved: false` when the definitions can't answer, so the caller asks the endpoint.
+   */
+  private async _getRemoteConfigPayloadLocally(
+    flagKey: string
+  ): Promise<{ resolved: true; payload: JsonType | undefined } | { resolved: false }> {
+    if (!this.featureFlagsPoller) {
+      return { resolved: false }
     }
-    return { payload: parsed, ok }
+    await this.featureFlagsPoller.loadFeatureFlags()
+
+    // Encrypted flags never reach the definitions. Servers that predate `is_remote_configuration`
+    // can't tell a remote config flag from a regular one, which the endpoint rejects.
+    const flag = this.featureFlagsPoller.featureFlagsByKey[flagKey]
+    if (typeof flag?.is_remote_configuration !== 'boolean') {
+      return { resolved: false }
+    }
+
+    if (!flag.is_remote_configuration || !flag.active || flag.deleted) {
+      return { resolved: true, payload: undefined }
+    }
+    return { resolved: true, payload: decodeRemoteConfigPayload(flag.filters?.payloads?.['true']) }
   }
 
   /**

@@ -491,7 +491,7 @@ export type PostHogOptions = Omit<
   enableLocalEvaluation?: boolean
   /**
    * Whether `getRemoteConfigPayload` caches payloads in memory and refreshes them in the background.
-   * Defaults to true.
+   * Defaults to true. Payloads that local evaluation answers from the flag definitions don't use this cache.
    *
    * A cached payload is returned immediately. Once it is older than `featureFlagsPollingInterval`
    * (30 seconds by default), the next call returns the cached value and refreshes it in the background.
@@ -710,6 +710,11 @@ export type PostHogFeatureFlag = {
   experiment_set: number[]
   /** Whether the flag is linked to an experiment. Absent when the server does not report it. */
   has_experiment?: boolean
+  /**
+   * Whether the flag is a remote config flag. `getRemoteConfigPayload` answers from the definitions
+   * only when this is present. Absent when the server does not report it.
+   */
+  is_remote_configuration?: boolean
   /**
    * Evaluation context tags set on the flag. The local evaluation poller keeps a flag only
    * when this list is empty or shares at least one entry with the SDK's `evaluationContexts`.
